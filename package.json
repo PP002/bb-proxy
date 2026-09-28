@@ -17,6 +17,7 @@
     "react-dom": "^19.3.0"
   },
   "devDependencies": {
+    "@cloudflare/puppeteer": "^1.4.0",
     "@tailwindcss/vite": "^4.3.3",
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
