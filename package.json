@@ -1,0 +1,9 @@
+{
+  "name": "bb-proxy",
+  "version": "1.0.0",
+  "private": true,
+  "devDependencies": {
+    "@cloudflare/puppeteer": "^1.0.0",
+    "wrangler": "^4.0.0"
+  }
+}

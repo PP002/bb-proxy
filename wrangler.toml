@@ -1,0 +1,8 @@
+name = "bb-proxy"
+main = "src/index.js"
+compatibility_date = "2026-09-28"
+compatibility_flags = ["nodejs_compat"]
+workers_dev = true
+
+[browser]
+binding = "BROWSER"
