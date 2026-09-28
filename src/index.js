@@ -1,11 +1,12 @@
 /**
- * Web Proxy for BlackBerry Passport Browser (v4 — server-side rendering)
+ * Web Proxy for BlackBerry Passport Browser (v6)
  *
  * Uses Cloudflare Browser Rendering (headless Chromium via @cloudflare/puppeteer)
  * to fully render JavaScript-heavy pages at the edge, then strips scripts and
  * sends the static HTML to the legacy BB10 browser.
  *
- * For non-HTML resources (images, CSS, JS, fonts), falls back to direct proxying.
+ * Only text/html requests are rendered; CSS/JS/images/fonts go through direct proxy.
+ * Browser launch errors (429 rate limit) gracefully fall back to direct proxy.
  */
 
 import puppeteer from "@cloudflare/puppeteer";
@@ -55,9 +56,20 @@ function getTargetFromReferer(request) {
   if (!referer) return null;
   try {
     var refUrl = new URL(referer);
+    var targetStr = null;
+
+    // Format 1: /proxy/https://example.com/path
     var proxyPrefix = "/proxy/";
-    if (!refUrl.pathname.startsWith(proxyPrefix)) return null;
-    var targetStr = refUrl.pathname.slice(proxyPrefix.length) + refUrl.search;
+    if (refUrl.pathname.startsWith(proxyPrefix)) {
+      targetStr = refUrl.pathname.slice(proxyPrefix.length) + refUrl.search;
+    }
+
+    // Format 2: /proxy?url=https%3A%2F%2Fexample.com
+    if (!targetStr && refUrl.pathname === "/proxy" && refUrl.searchParams.has("url")) {
+      targetStr = refUrl.searchParams.get("url");
+    }
+
+    if (!targetStr) return null;
     var targetUrl = new URL(targetStr);
     if (!ALLOWED_PROTOCOLS.includes(targetUrl.protocol)) return null;
     return targetUrl;
@@ -115,14 +127,21 @@ function rewriteHtml(workerUrl, html, baseUrl) {
     return inner;
   });
 
-  // Inject <base> tag so relative URLs resolve through proxy
+  // Inject <base> tag and form-submit helper script into <head>
   var baseTag = '<base href="' + buildProxyUrl(workerUrl, baseUrl) + '">';
+  var formScript = '<script>document.addEventListener("keydown",function(e){if(e.keyCode===13){var t=e.target;var isText=t.tagName==="TEXTAREA"||(t.tagName=="INPUT"&&(t.type=="text"||t.type=="search"));if(isText){var f=t.form;if(f){e.preventDefault();f.submit()}}}},true);</script>';
+  var inject = baseTag + formScript;
   if (BASE_TAG_RE.test(result)) {
     result = result.replace(BASE_TAG_RE, baseTag);
+    if (HEAD_RE.test(result)) {
+      result = result.replace(HEAD_RE, function(match) { return match + formScript; });
+    } else {
+      result = formScript + result;
+    }
   } else if (HEAD_RE.test(result)) {
-    result = result.replace(HEAD_RE, function(match) { return match + baseTag; });
+    result = result.replace(HEAD_RE, function(match) { return match + inject; });
   } else {
-    result = baseTag + result;
+    result = inject + result;
   }
 
   result = result.replace(SRCSET_RE, function(match, open, val, close) {
@@ -171,18 +190,24 @@ function rewriteHeaders(workerUrl, headers, baseUrl) {
 /**
  * Render a page using Browser Rendering (headless Chromium) and return
  * the fully rendered HTML with scripts stripped.
+ * Returns null on any error (including 429 rate limit) so caller can fall back.
  */
 async function renderPage(targetUrl, env, workerUrl) {
   console.log("[bb-proxy] RENDER: launching browser for", targetUrl.href);
 
-  const browser = await puppeteer.launch(env.BROWSER);
+  var browser;
+  try {
+    browser = await puppeteer.launch(env.BROWSER);
+  } catch (err) {
+    console.log("[bb-proxy] RENDER LAUNCH ERROR:", err.message);
+    return null;
+  }
+
   try {
     const page = await browser.newPage();
 
-    // Set a desktop viewport so we get full content
     await page.setViewport({ width: 1280, height: 800 });
 
-    // Set a modern User-Agent
     await page.setUserAgent(
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
     );
@@ -193,14 +218,11 @@ async function renderPage(targetUrl, env, workerUrl) {
       timeout: 20000,
     });
 
-    // Give JS frameworks time to render
     await page.waitForFunction("document.readyState === 'complete'", { timeout: 10000 }).catch(() => {});
 
-    // Get the fully rendered HTML
     const content = await page.content();
     console.log("[bb-proxy] RENDER: got content, length:", content.length);
 
-    // Strip scripts and rewrite URLs
     const rewritten = rewriteHtml(workerUrl, content, targetUrl.href);
     console.log("[bb-proxy] RENDER: rewritten length:", rewritten.length);
 
@@ -215,12 +237,15 @@ async function renderPage(targetUrl, env, workerUrl) {
     console.log("[bb-proxy] RENDER ERROR:", err.message, err.stack);
     return null;
   } finally {
-    await browser.close();
+    if (browser) {
+      try { await browser.close(); } catch (e) {}
+    }
   }
 }
 
 /**
- * Direct proxy (no rendering) for non-HTML resources
+ * Direct proxy (no rendering) for non-HTML resources.
+ * Also handles HTML as fallback when rendering fails — rewrites HTML URLs too.
  */
 async function proxyRequest(request, targetUrl, workerUrl) {
   var reqHeaders = new Headers(request.headers);
@@ -263,6 +288,17 @@ async function proxyRequest(request, targetUrl, workerUrl) {
   respHeaders.set("Access-Control-Allow-Origin", "*");
 
   var contentType = (respHeaders.get("content-type") || "").toLowerCase();
+
+  // Rewrite HTML even in direct proxy mode (fallback when rendering fails)
+  if (contentType.includes("text/html")) {
+    var html = await response.text();
+    var rewrittenHtml = rewriteHtml(workerUrl, html, targetUrl.href);
+    return new Response(rewrittenHtml, {
+      status: response.status,
+      statusText: response.statusText,
+      headers: respHeaders,
+    });
+  }
 
   if (contentType.includes("text/css")) {
     var css = await response.text();
@@ -321,10 +357,11 @@ export default {
     var targetUrl = new URL(targetUrlStr);
     console.log("[bb-proxy] target:", targetUrl.href);
 
-    // For HTML page requests, try server-side rendering first
-    // For non-HTML (images, CSS, JS, fonts, API calls), use direct proxy
+    // Only render pages that explicitly accept HTML — CSS/JS/image requests
+    // have accept headers like "text/css,*/*" or "image/webp,*/*" or "*/*" and
+    // must go through direct proxy to avoid wasting browser sessions (429)
     var accept = (request.headers.get("accept") || "").toLowerCase();
-    var isPageRequest = accept.includes("text/html") || accept.includes("*/*");
+    var isPageRequest = accept.includes("text/html");
 
     if (isPageRequest && env.BROWSER) {
       console.log("[bb-proxy] attempting server-side render for", targetUrl.href);

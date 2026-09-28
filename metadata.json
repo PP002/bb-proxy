@@ -1,0 +1,8 @@
+{
+  "name": "BB-Proxy — BlackBerry & Legacy Web Proxy",
+  "description": "High-performance web proxy and HTML sanitizing renderer for BlackBerry 10 / Passport and legacy devices with real-time rewriting, script stripping, and live preview simulator.",
+  "permissions": [],
+  "capabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
